@@ -49,13 +49,14 @@ The following Lambda functions are included in the /lambda directory:
 - `s3_notification`: Handles S3 bucket notifications
 - `cur_initializer`: Initializes Cost and Usage Report (CUR)
 - `clean_up_buckets`: Cleans up temporary S3 buckets
-- `cfn_response`: Handles CloudFormation responses
 
 Before applying the Terraform configuration, you need to package these Lambda functions:
 
-zip -j lambda_bucket_cleanup.zip lambda/clean_up_buckets.py lambda/cfnresponse.py
-zip -j lambda_function_payload.zip lambda/cur_initializer.py lambda/cfnresponse.py
-zip -j lambda_s3_notification.zip lambda/s3_notification.py lambda/cfnresponse.py
+```bash
+zip -j lambda_bucket_cleanup.zip lambda/clean_up_buckets.py
+zip -j lambda_function_payload.zip lambda/cur_initializer.py
+zip -j lambda_s3_notification.zip lambda/s3_notification.py
+```
 
 ## Notes
 

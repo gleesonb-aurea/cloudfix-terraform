@@ -13,12 +13,12 @@ variable "region" {
 
 variable "tenant_id" {
   description = "CloudFix TenantId"
-  default     = "8727b669-2ab7-4669-ba64-2754fc749117"
+  default     = ""
 }
 
 variable "external_id" {
   description = "CloudFix ExternalId"
-  default     = "c58baa5e-62bb-4e21-9892-26da71ec993d"
+  default     = ""
 }
 
 variable "resource_suffix" {
@@ -220,7 +220,7 @@ resource "aws_iam_role" "cloudfix_finder_role" {
           Resource = "*"
         }
       ]
-    })
+    ])
   }
 
   inline_policy {
@@ -1266,41 +1266,15 @@ resource "aws_lambda_function" "cloudfix_crawler_initializer" {
   depends_on = [aws_glue_crawler.cloudfix_cur_crawler]
 }
 
-# Note: You would need to create an actual ZIP file with the Lambda code
-# This is a placeholder for the Lambda function code file
-resource "local_file" "lambda_handler" {
-  content = <<-EOF
-#!/usr/bin/env python3
-import boto3
-import cfnresponse
-import os
-
-def return_response_to_cf(event, context, status, reason):
-  if event and event.get('ResponseURL'):
-    cfnresponse.send(event, context, status, {}, reason=reason)
-
-def handler(event, context):
-  print("Event received:", event)
-  if event.get('RequestType', '') == 'Delete':
-    return_response_to_cf(event, context, cfnresponse.SUCCESS, "Delete successful")
-  else:
-    glue = boto3.client('glue')
-    try:
-      glue.start_crawler(Name=os.environ['CUR_CRAWLER_NAME'])
-      return_response_to_cf(event, context, cfnresponse.SUCCESS, "Create successful")
-    except Exception as e:
-      return_response_to_cf(event, context, cfnresponse.FAILED, str(e))
-EOF
-  filename = "lambda_handler.py"
-}
-
+# Lambda functions are now managed as separate files in the lambda directory
 resource "null_resource" "create_lambda_zip" {
   triggers = {
-    handler_content = local_file.lambda_handler.content
+    # Trigger rebuild when any Lambda files change
+    cur_initializer = filemd5("${path.module}/lambda/cur_initializer.py")
   }
 
   provisioner "local-exec" {
-    command = "zip -j lambda_function_payload.zip ${local_file.lambda_handler.filename}"
+    command = "zip -j lambda_function_payload.zip ${path.module}/lambda/cur_initializer.py"
   }
 }
 
@@ -1366,10 +1340,90 @@ resource "aws_glue_catalog_table" "cloudfix_cur_status" {
   }
 }
 
-# 8. CloudFix Notification (Replacement for CloudFormation Custom Resource)
+# 8. CloudFix SNS Notification
+resource "aws_sns_topic" "cloudfix_notification" {
+  name = "cloudfix-notification${var.resource_suffix}"
+  
+  tags = {
+    "cloudfix:fixerId" = "CloudFix Infrastructure${var.resource_suffix}"
+  }
+}
 
-# This is a placeholder for the notification mechanism to CloudFix
-# You would need to implement a method to notify CloudFix about the resources created
+resource "aws_sns_topic_policy" "cloudfix_notification" {
+  arn = aws_sns_topic.cloudfix_notification.arn
+  
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid = "CloudFixPublish"
+        Effect = "Allow"
+        Principal = {
+          AWS = local.account_id
+        }
+        Action = "SNS:Publish"
+        Resource = aws_sns_topic.cloudfix_notification.arn
+      }
+    ]
+  })
+}
+
+resource "aws_lambda_function" "cloudfix_notification" {
+  filename      = "lambda_notification.zip"
+  function_name = "CloudFix_Notification${var.resource_suffix}"
+  role          = aws_iam_role.cloudfix_lambda_notification_role.arn
+  handler       = "notification.handler"
+  runtime       = "python3.10"
+
+  environment {
+    variables = {
+      SNS_TOPIC_ARN = aws_sns_topic.cloudfix_notification.arn
+      TENANT_ID     = var.tenant_id
+      EXTERNAL_ID   = var.external_id
+    }
+  }
+
+  tags = {
+    "cloudfix:fixerId" = "CloudFix Infrastructure${var.resource_suffix}"
+  }
+}
+
+resource "aws_iam_role" "cloudfix_lambda_notification_role" {
+  name = "cloudfix-lambda-notification-role${var.resource_suffix}"
+  
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "lambda.amazonaws.com"
+        }
+      }
+    ]
+  })
+
+  inline_policy {
+    name = "sns-publish"
+    policy = jsonencode({
+      Version = "2012-10-17"
+      Statement = [
+        {
+          Effect = "Allow"
+          Action = [
+            "sns:Publish"
+          ]
+          Resource = [
+            aws_sns_topic.cloudfix_notification.arn
+          ]
+        }
+      ]
+    })
+  }
+}
+
+# Notify CloudFix about created resources
 resource "null_resource" "cloudfix_notification" {
   triggers = {
     finder_role_arn      = aws_iam_role.cloudfix_finder_role.arn
@@ -1385,24 +1439,24 @@ resource "null_resource" "cloudfix_notification" {
     stack_region         = var.region
   }
 
-  # In a real implementation, you would send this information to CloudFix
-  # This could be via HTTP POST, SNS, or another method
   provisioner "local-exec" {
     command = <<-EOT
-      echo "Terraform has created the following resources for CloudFix:"
-      echo "Account ID: ${local.account_id}"
-      echo "Tenant ID: ${var.tenant_id}"
-      echo "External ID: ${var.external_id}"
-      echo "Finder Role ARN: ${aws_iam_role.cloudfix_finder_role.arn}"
-      echo "Athena Role ARN: ${aws_iam_role.cloudfix_athena_query_execution_role.arn}"
-      echo "SSM Update Role ARN: ${aws_iam_role.cloudfix_ssm_update_role.arn}"
-      echo "SSM Assumed Role ARN: ${aws_iam_role.cloudfix_ssm_assumed_role.arn}"
-      echo "Approver Role ARN: ${aws_iam_role.cloudfix_fixer_approver_role.arn}"
-      echo "Backup Job Role ARN: ${aws_iam_role.cloudfix_backup_job_role.arn}"
+      aws lambda invoke \
+        --function-name ${aws_lambda_function.cloudfix_notification.function_name} \
+        --payload '{"roles": {
+          "finder_role_arn": "${aws_iam_role.cloudfix_finder_role.arn}",
+          "athena_role_arn": "${aws_iam_role.cloudfix_athena_query_execution_role.arn}",
+          "ssm_update_role_arn": "${aws_iam_role.cloudfix_ssm_update_role.arn}",
+          "ssm_assumed_role_arn": "${aws_iam_role.cloudfix_ssm_assumed_role.arn}",
+          "approver_role_arn": "${aws_iam_role.cloudfix_fixer_approver_role.arn}",
+          "backup_job_role_arn": "${aws_iam_role.cloudfix_backup_job_role.arn}"
+        }}' \
+        response.json
     EOT
   }
 
   depends_on = [
+    aws_lambda_function.cloudfix_notification,
     aws_iam_role.cloudfix_finder_role,
     aws_iam_role.cloudfix_athena_query_execution_role,
     aws_iam_role.cloudfix_ssm_update_role,
